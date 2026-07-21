@@ -123,9 +123,9 @@ ROLES = ("dev", "review", "triage")
 
 
 def _make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIAdapter]:
-    from .adapters.generic import GenericAdapter, GenericDevAdapter
     from .adapters.multiplexer import get_multiplexer, mux_usable
     from .adapters.profile import ProfileError, get_profile
+    from .adapters.registry import AdapterError, get_adapter_kind
 
     # The dev skill (bmad-dev-auto) writes no result.json: its adapter
     # synthesizes the result from the spec, and so needs the project paths to
@@ -141,7 +141,10 @@ def _make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIA
         # session re-invokes the dev skill on the done spec for a follow-up pass),
         # and the skill writes no result.json — its adapter synthesizes the result
         # from the spec it leaves on disk, so it needs the project paths to find
-        # that spec and cannot be shared with the triage role even on identical config.
+        # that spec and cannot be shared with the triage role even on identical
+        # config. `synthesizes` is a bmad-dev-auto pipeline concept (which variant
+        # of a family to build + whether to thread `paths`), NOT a per-family
+        # branch — it stays a documented contract for every registered adapter.
         synthesizes = role in ("dev", "review") and policy.dev.skill == "bmad-dev-auto"
         key = (cfg, synthesizes)
         if key not in by_cfg:
@@ -149,34 +152,27 @@ def _make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIA
                 profile = get_profile(cfg.name, project)
             except ProfileError as e:
                 raise SystemExit(f"error: {e}") from e
-            if profile.hookless:
-                # Hookless profiles (opencode-http) are driven over HTTP/SSE —
-                # the tmux adapters below cannot host them.
-                from .adapters.opencode_http import (
-                    OpencodeDevAdapter,
-                    OpencodeHttpAdapter,
-                    OpencodeServerError,
-                )
-
-                common = dict(
-                    run_dir=run_dir,
-                    policy=policy,
-                    profile=profile,
-                    extra_args=cfg.extra_args,
-                    usage_grace_s=cfg.usage_grace_s,
-                    stop_without_result_nudges=cfg.stop_without_result_nudges,
-                )
-                try:
-                    by_cfg[key] = (
-                        OpencodeDevAdapter(**common, paths=paths)
-                        if synthesizes
-                        else OpencodeHttpAdapter(**common)
-                    )
-                except OpencodeServerError as e:
-                    raise SystemExit(f"error: {e}") from e
-            else:
-                # Resolve and probe the shared multiplexer only when a profile
-                # actually uses it; hookless HTTP/SSE runs need no transport.
+            # Which adapter class drives this CLI is pure data — profile.adapter
+            # resolved against the registry. No adapter-name branching lives here;
+            # a new family (Hermes, herdr, ...) plugs in with zero edits to this
+            # function. An unknown kind fails loud naming the profile.
+            try:
+                kind = get_adapter_kind(profile.adapter)
+            except AdapterError as e:
+                raise SystemExit(f"error: profile {profile.name!r}: {e}") from e
+            builder = kind.load()
+            common = dict(
+                run_dir=run_dir,
+                policy=policy,
+                profile=profile,
+                extra_args=cfg.extra_args,
+                usage_grace_s=cfg.usage_grace_s,
+                stop_without_result_nudges=cfg.stop_without_result_nudges,
+            )
+            if kind.needs_mux:
+                # Resolve and probe the shared multiplexer only when a kind
+                # actually drives one; hookless HTTP/SSE families need no
+                # transport (and monkeypatched tests assert it is never touched).
                 if mux is None:
                     mux = get_multiplexer()
                     if not mux_usable(mux):
@@ -190,20 +186,17 @@ def _make_adapters(project: Path, run_dir: Path, policy) -> dict[str, CodingCLIA
                             "missing, the version is unsupported, or a required helper is "
                             "absent (psmux needs `pwsh` on PATH); see `bmad-loop diagnose`"
                         )
-                common = dict(
-                    run_dir=run_dir,
-                    policy=policy,
-                    profile=profile,
-                    extra_args=cfg.extra_args,
-                    usage_grace_s=cfg.usage_grace_s,
-                    stop_without_result_nudges=cfg.stop_without_result_nudges,
-                    mux=mux,
-                )
-                by_cfg[key] = (
-                    GenericDevAdapter(**common, paths=paths)
-                    if synthesizes
-                    else GenericAdapter(**common)
-                )
+                common["mux"] = mux
+            # The synthesizing variant additionally needs `paths`; the plain
+            # variant does not accept it. construct_error is family-declared —
+            # `()` for a family that can't fail construction (generic), or e.g.
+            # `(OpencodeServerError,)` for one that can — and becomes a SystemExit.
+            cls = builder.dev if synthesizes else builder.plain
+            build_kwargs = {**common, "paths": paths} if synthesizes else common
+            try:
+                by_cfg[key] = cls(**build_kwargs)
+            except builder.construct_error as e:
+                raise SystemExit(f"error: {e}") from e
         adapters[role] = by_cfg[key]
     return adapters
 
@@ -359,7 +352,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # story-queue gate runs below: the sprint-status file (sprint mode) or the
     # stories.yaml manifest (stories mode). Loaded before the queue gate so a
     # stories-only project is not failed on a missing sprint-status.yaml.
-    from .adapters.profile import ProfileError, get_profile
+    from .adapters.profile import ProfileError, external_profile_errors, get_profile
 
     profiles = []
     profile_by_name: dict[str, object] = {}
@@ -476,6 +469,42 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 f"run `bmad-loop init --cli {profile.name}`",
                 {"profile": profile.name, "config_path": str(hook_config)},
             )
+
+    # Adapter-kind validity is enforced against the LIVE registry, never a
+    # hardcoded set: a profile.adapter naming no registered kind is a config error
+    # (a typo, or an uninstalled plugin package). External adapter/profile packages
+    # that failed to load are surfaced as warnings — selection already degraded
+    # past them (the same non-blocking treatment as a failed mux backend package).
+    from .adapters.registry import external_adapter_errors, known_adapter_kinds
+
+    kinds = known_adapter_kinds()
+    for profile in profiles:
+        if profile.adapter in kinds:
+            report.ok(
+                "adapter.kind",
+                f"{profile.name}: adapter kind {profile.adapter!r} registered",
+                {"profile": profile.name, "adapter": profile.adapter},
+            )
+        else:
+            report.fail(
+                "adapter.kind",
+                f"{profile.name}: unknown adapter kind {profile.adapter!r} — "
+                f"known: {', '.join(kinds)} (install the plugin that provides it, "
+                f"or fix the profile's `adapter`)",
+                {"profile": profile.name, "adapter": profile.adapter, "known": kinds},
+            )
+    for ep_name, reason in sorted(external_adapter_errors().items()):
+        report.warn(
+            "adapter.external",
+            f"external adapter '{ep_name}' failed to load: {reason}",
+            {"entry_point": ep_name, "error": reason},
+        )
+    for ep_name, reason in sorted(external_profile_errors().items()):
+        report.warn(
+            "adapter.external-profile",
+            f"external profile '{ep_name}' failed to load: {reason}",
+            {"entry_point": ep_name, "error": reason},
+        )
 
     # opencode config-file model ids are "provider/model" (see the opencode_http docstring);
     # a bare model name silently falls back to the server's default model, so warn
@@ -625,6 +654,57 @@ def _mux_set(project: Path, args: argparse.Namespace) -> int:
         )
     policy_mod.write_mux_backend(path, args.name)  # a junk name raises PolicyError → main()
     print(f'mux backend set to "{args.name}" in {path}')
+    return 0
+
+
+def cmd_adapters(args: argparse.Namespace) -> int:
+    """List the registered coding-CLI adapter kinds (the CLI axis's counterpart to
+    `bmad-loop mux` for the transport axis) and name any out-of-tree adapter or
+    profile package that failed to load. Unlike `mux`, there is no global choice
+    to persist: an adapter kind is selected per profile by its `adapter` field."""
+    from .adapters.profile import external_profile_errors, load_profiles
+    from .adapters.registry import detect_adapters, external_adapter_errors
+
+    # Loading profiles also triggers the bmad_loop.profiles entry-point scan, so a
+    # broken profile package surfaces below alongside a broken adapter package.
+    profiles = load_profiles(_project(args))
+    by_kind: dict[str, list[str]] = {}
+    for prof in profiles.values():
+        by_kind.setdefault(prof.adapter, []).append(prof.name)
+
+    rows = detect_adapters()
+    header = ("NAME", "ORIGIN", "NEEDS MUX", "PROFILES")
+    table = [
+        (
+            r.name,
+            "builtin" if r.builtin else "external",
+            "yes" if r.needs_mux else "no",
+            ", ".join(sorted(by_kind.get(r.name, []))) or "-",
+        )
+        for r in rows
+    ]
+    widths = [max(len(h), *(len(row[i]) for row in table), 0) for i, h in enumerate(header)]
+    for row in (header, *table):
+        print("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip())
+    # A profile whose adapter kind never registered (a typo, or an uninstalled
+    # plugin) is invisible in the table above — name it so an operator can see the
+    # dangling reference, exactly as `mux` names a failed backend package.
+    known = {r.name for r in rows}
+    for kind in sorted(set(by_kind) - known):
+        print(
+            f"warning: profile(s) {', '.join(sorted(by_kind[kind]))} reference unknown "
+            f"adapter kind '{kind}' (no registered kind or plugin provides it)",
+            file=sys.stderr,
+        )
+    for ep_name, reason in sorted(external_adapter_errors().items()):
+        print(f"warning: external adapter '{ep_name}' failed to load: {reason}", file=sys.stderr)
+    for ep_name, reason in sorted(external_profile_errors().items()):
+        print(f"warning: external profile '{ep_name}' failed to load: {reason}", file=sys.stderr)
+    print(
+        "adapter kind is selected per profile by its `adapter` field "
+        "(default: generic); an out-of-tree package registers new kinds via the "
+        "bmad_loop.adapters + bmad_loop.profiles entry points"
+    )
     return 0
 
 
@@ -2322,6 +2402,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with set: persist a name not registered in this process (e.g. a plugin "
         "backend that only registers on the target machine)",
+    )
+
+    add(
+        "adapters",
+        cmd_adapters,
+        "list registered coding-CLI adapter kinds + which profiles select them",
     )
 
     probe_p = add(

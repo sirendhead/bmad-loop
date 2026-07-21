@@ -9,10 +9,24 @@ Built-in profiles ship as packaged TOML (bmad_loop/data/profiles/*.toml) and
 project-local TOML files in <project>/.bmad-loop/profiles/*.toml overlay them
 (same name overrides, new names extend) — adding a CLI that clones an
 existing hook dialect needs no Python.
+
+An out-of-tree package advertises additional profiles under the
+``bmad_loop.profiles`` entry-point group (:func:`load_profiles` scans it): the
+companion to the ``bmad_loop.adapters`` registry (:mod:`~.registry`), so a
+co-installed adapter package ships both its class and the profile that selects
+it with zero project config. Precedence is packaged < entry-point < project (a
+project TOML always wins). A broken entry point degrades to a recorded reason
+(:func:`external_profile_errors`), never a crash.
+
+Which adapter *class* drives a profile is the ``adapter`` field, resolved against
+the :mod:`~.registry` — it is read here but intentionally **not** validated at
+parse time (an unknown kind is caught at construction / by ``validate``, against
+the live registry, never a hardcoded set).
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import tomllib
 from dataclasses import dataclass, field
 from importlib import resources
@@ -54,6 +68,15 @@ class CLIProfile:
     name: str
     binary: str
     hooks: HookSpec
+    # Which adapter *class* drives this CLI — a key resolved against the adapter
+    # registry (adapters/registry.py), not a hardcoded enum. "generic" = the
+    # bundled tmux-injection + hook-signal adapter; "opencode-http" = the bundled
+    # HTTP/SSE adapter; an out-of-tree package registers its own. Read but NOT
+    # validated at parse time: an unknown kind fails loud at construction and as a
+    # `validate` finding, both against the live registry. A hookless HTTP profile
+    # (hooks.dialect = "none") MUST set this to its HTTP adapter kind — the
+    # transport (hookless) and the driving class are now decoupled axes.
+    adapter: str = "generic"
     # project-relative tree this CLI reads skills from, e.g. ".claude/skills"
     # (claude) or ".agents/skills" (codex/gemini); `bmad-loop init` installs the
     # bundled bmad-loop-* skills here.
@@ -166,10 +189,17 @@ def _parse_profile(doc: dict, source: str) -> CLIProfile:
         if not seed or is_absolute_path(seed) or has_parent_ref(seed):
             raise fail(f"seed_files entries must be project-relative paths: got {seed!r}")
 
+    # Read but deliberately not validated here: validity of `adapter` is enforced
+    # against the live adapter registry (at construction and by `validate`), never
+    # a set literal every new adapter would have to edit. Parsing must stay import-
+    # cycle-free, so profile.py never imports the registry.
+    adapter = str(doc.get("adapter", "generic"))
+
     return CLIProfile(
         name=name,
         binary=binary,
         hooks=HookSpec(dialect=dialect, config_path=config_path, events=events),
+        adapter=adapter,
         skill_tree=skill_tree,
         prompt_template=str(doc.get("prompt_template", "{prompt}")),
         launch_args=tuple(str(a) for a in doc.get("launch_args", ())),
@@ -193,14 +223,83 @@ def _load_toml(text: str, source: str) -> CLIProfile:
     return _parse_profile(doc, source)
 
 
+# The entry-point group an out-of-tree package advertises extra profiles under —
+# the companion to adapters/registry.py's `bmad_loop.adapters` group. Each entry
+# point loads to a provider: a callable returning an iterable of CLIProfile (or an
+# iterable directly), e.g. one built from the package's own bundled TOML. Scanned
+# once per process (a third-party import failure is not transient); the resulting
+# profiles are process-global (project-independent), so only the project overlay
+# is re-read per load_profiles call. A broken entry point is recorded, not raised.
+PROFILES_GROUP = "bmad_loop.profiles"
+_EXTERNALS_LOADED = False
+_EXTERNAL_PROFILES: dict[str, CLIProfile] = {}
+_PROFILE_LOAD_ERRORS: dict[str, str] = {}
+
+
+def _coerce_profiles(produced: object, ep_name: str) -> list[CLIProfile]:
+    """A provider may return a callable's result or an iterable directly; either
+    way it must yield CLIProfile instances. Anything else is the package's bug —
+    reported (per :func:`external_profile_errors`), never trusted into the map."""
+    try:
+        items = list(produced)
+    except TypeError as exc:
+        raise ProfileError(
+            f"{ep_name}: profile provider must return an iterable of CLIProfile"
+        ) from exc
+    for item in items:
+        if not isinstance(item, CLIProfile):
+            raise ProfileError(
+                f"{ep_name}: profile provider yielded {type(item).__name__}, not CLIProfile"
+            )
+    return items
+
+
+def _load_external_profiles() -> dict[str, CLIProfile]:
+    """Import every ``bmad_loop.profiles`` entry point and collect the profiles it
+    provides, first-registration-wins on a name collision. Scan-once; failures are
+    recorded in ``_PROFILE_LOAD_ERRORS`` (surfaced via
+    :func:`external_profile_errors`), never raised — a broken adapter package must
+    not break profile loading for everything else."""
+    global _EXTERNALS_LOADED
+    if _EXTERNALS_LOADED:
+        return _EXTERNAL_PROFILES
+    _EXTERNALS_LOADED = True
+    try:
+        eps = importlib.metadata.entry_points(group=PROFILES_GROUP)
+    except Exception as exc:  # noqa: BLE001 — diagnostics path, never crash loading
+        _PROFILE_LOAD_ERRORS["<entry-point scan>"] = f"{type(exc).__name__}: {exc}"
+        return _EXTERNAL_PROFILES
+    for ep in eps:
+        try:
+            provider = ep.load()
+            produced = provider() if callable(provider) else provider
+            for profile in _coerce_profiles(produced, ep.name):
+                _EXTERNAL_PROFILES.setdefault(profile.name, profile)
+        except Exception as exc:  # noqa: BLE001 — one bad package must not hide the rest
+            _PROFILE_LOAD_ERRORS[ep.name] = f"{type(exc).__name__}: {exc}"
+    return _EXTERNAL_PROFILES
+
+
+def external_profile_errors() -> dict[str, str]:
+    """Entry-point name -> failure reason for every external profile provider that
+    failed to load this process (empty when all loaded). For diagnostics surfaces."""
+    return dict(_PROFILE_LOAD_ERRORS)
+
+
 def load_profiles(project: Path | None = None) -> dict[str, CLIProfile]:
-    """Packaged built-ins, overlaid by <project>/.bmad-loop/profiles/*.toml."""
+    """Packaged built-ins, overlaid by ``bmad_loop.profiles`` entry-point
+    profiles, overlaid by <project>/.bmad-loop/profiles/*.toml.
+
+    Precedence is packaged < entry-point < project: a co-installed adapter package
+    extends (or overrides) the bundled set, and a project TOML always wins."""
     profiles: dict[str, CLIProfile] = {}
     packaged = resources.files("bmad_loop.data").joinpath("profiles")
     for entry in sorted(packaged.iterdir(), key=lambda e: e.name):
         if entry.name.endswith(".toml"):
             profile = _load_toml(entry.read_text(encoding="utf-8"), entry.name)
             profiles[profile.name] = profile
+    for name, profile in _load_external_profiles().items():
+        profiles[name] = profile
     if project is not None:
         user_dir = project / USER_PROFILES_REL
         if user_dir.is_dir():

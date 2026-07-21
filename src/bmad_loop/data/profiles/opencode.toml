@@ -4,6 +4,9 @@
 # API facts pinned against opencode 1.18.2 (2026-07-16): see the adapters/opencode_http.py docstring.
 name = "opencode-http"
 binary = "opencode"
+# Driven by the bundled HTTP/SSE adapter class (adapters/registry.py), not the
+# tmux generic adapter — the selector for the coding-CLI adapter axis.
+adapter = "opencode-http"
 prompt_template = "Use the {skill} skill now: {args}"
 usage_parser = "none"
 skill_tree = ".claude/skills"

@@ -14,7 +14,10 @@ bmad-loop a new CLI:
 - **The advanced case — a new adapter class.** If the CLI does _not_ fit that
   transport (e.g. an HTTP/SSE service), see
   [Writing a new adapter class](#writing-a-new-adapter-class) for the
-  `CodingCLIAdapter` ABC.
+  `CodingCLIAdapter` ABC — and
+  [Shipping a new adapter class out-of-tree](#shipping-a-new-adapter-class-out-of-tree)
+  to register it (and its profile) from a co-installed package with **zero core
+  edits**, the same way a transport backend ships out-of-tree.
 
 ## Two axes: CLI vs transport
 
@@ -22,7 +25,11 @@ These are independent and abstracted separately:
 
 - **CLI axis** — `CodingCLIAdapter` (`adapters/base.py`): _which_ binary to launch,
   how the prompt is rendered, the hook dialect, where the transcript lives. The
-  generic adapter + a TOML profile cover this; the rest of this guide is about it.
+  generic adapter + a TOML profile cover the common case; a CLI needing its own
+  adapter class registers it via `register_adapter(...)`
+  (`adapters/registry.py`) — selected by the profile's `adapter` field and
+  shippable out-of-tree, just like a transport backend. Most of this guide is
+  about this axis.
 - **Transport axis** — `TerminalMultiplexer` (`adapters/multiplexer.py`): how
   sessions, windows, and panes are created, observed, and torn down. The generic
   adapter never shells out itself — it goes through `self.mux`, obtained from
@@ -357,23 +364,24 @@ resolves to `claude`.
 
 ### `CLIProfile`
 
-| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                 |
-| ---------------------------------- | -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                    |
-| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                              |
-| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                       |
-| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                        |
-| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                  |
-| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                        |
-| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                           |
-| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                |
-| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                            |
-| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                 |
-| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                         |
-| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                               |
-| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end. |
-| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                         |
-| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                      |
+| Field                              | Required | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------------------------------- | -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`                             | ✅       | —                  | Profile id, also the `--cli` value and override key.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `binary`                           | ✅       | —                  | Executable to launch (resolved on `PATH`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `[hooks]`                          | ✅       | —                  | The `HookSpec` table (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `adapter`                          |          | `generic`          | Which adapter **class** drives this CLI, resolved against the adapter registry (`adapters/registry.py`) — not a hardcoded enum. `generic` = the bundled tmux + hook-signal adapter; `opencode-http` = the bundled HTTP/SSE adapter; an out-of-tree package registers its own (see [Shipping a new adapter class out-of-tree](#shipping-a-new-adapter-class-out-of-tree)). Read but not validated at parse time — an unknown kind fails loud at construction and as a `validate` finding, both against the live registry. |
+| `skill_tree`                       |          | `.claude/skills`   | Project-relative tree this CLI reads skills from (`.agents/skills` for codex/gemini); `bmad-loop init` installs the `bmad-loop-*` skills here. Must be relative.                                                                                                                                                                                                                                                                                                                                                         |
+| `prompt_template`                  |          | `{prompt}`         | How the canonical `/skill args` prompt is rendered. Placeholders: `{prompt}` (whole string), `{skill}` (leading slash-command name, no `/`), `{args}` (the remainder).                                                                                                                                                                                                                                                                                                                                                   |
+| `launch_args`                      |          | `()`               | Extra argv passed at launch, e.g. `["-i"]` to stay interactive (gemini/copilot).                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `bypass_args`                      |          | `()`               | Flags that bypass permission/approval prompts for unattended runs (e.g. `--allow-all-tools`).                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `model_flag`                       |          | `--model`          | Flag used to pass the model name when one is configured.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `env`                              |          | `{}`               | Extra environment variables for the session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `usage_parser`                     |          | `none`             | Which transcript token parser to use — one of `claude-jsonl`, `codex-rollout`, `gemini-chat`, `copilot-events`, `none`.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `usage_grace_s`                    |          | `0.0`              | Seconds to keep polling the transcript for token totals after the session ends. `0` = read once. Raise it for CLIs that flush totals only on shutdown (copilot writes `modelMetrics` ~1s after the turn-end hook). Must be ≥ 0.                                                                                                                                                                                                                                                                                          |
+| `stop_without_result_nudges`       |          | unset (use global) | Per-adapter floor for Stop-without-result nudges. Leave unset to inherit `limits.stop_without_result_nudges`. Raise it for CLIs that fire a turn-end hook _per response turn_ (copilot's `agentStop`), where the global default of 1 declares them stalled too early. Must be ≥ 0 if set.                                                                                                                                                                                                                                |
+| `subagent_stop_without_transcript` |          | `false`            | Set `true` for CLIs that fire the turn-end hook for _subagent_ turns too, with an empty `transcriptPath` and a tool-use session id (copilot's `agentStop`). A `Stop` carrying no transcript is then treated as a subagent stop and ignored, so the main session's real turn-end drives completion. Leave `false` and every `Stop` is the main turn-end.                                                                                                                                                                  |
+| `first_run_note`                   |          | `""`               | Human note printed by `init` about a manual first-run/auth step this CLI needs.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `seed_files`                       |          | `()`               | Project-relative gitignored configs (MCP/CLI settings) a `git worktree add` checkout omits; `provision_worktree` copies them into isolated dev/review worktrees. Must be relative.                                                                                                                                                                                                                                                                                                                                       |
 
 ### `HookSpec` (the `[hooks]` table)
 
@@ -522,6 +530,83 @@ adapter against a scripted stdlib FakeOpencode (no binary, no network beyond
 127.0.0.1), and [`tests/test_opencode_live.py`](../tests/test_opencode_live.py)
 smoke-checks the pinned HTTP contract against a real local binary — skipped
 when absent, zero tokens spent.
+
+### Shipping a new adapter class out-of-tree
+
+A new adapter class does **not** have to live in the bmad-loop repo. Which class
+drives a CLI is data — the profile's `adapter` field, resolved against the
+adapter registry ([`adapters/registry.py`](../src/bmad_loop/adapters/registry.py))
+— so a co-installed package registers its own kind with no edit to any core
+`.py`, exactly as a transport backend ships via `bmad_loop.mux_backends`
+([the transport contract](#the-transport-contract-for-a-backend-author)). The
+reference layout is the out-of-tree
+[herdr backend](https://github.com/pbean/bmad-loop-adapter-herdr).
+
+Ship a pip/uv package that advertises **two entry points**:
+
+- **`bmad_loop.adapters`** → a module whose import registers the kind. Core imports
+  it (after the builtins, so a bundled name always wins) before it resolves any
+  adapter:
+
+  ```python
+  # acme_adapter/__init__.py
+  from bmad_loop.adapters.registry import AdapterBuilder, register_adapter
+
+  def _load():                       # lazy: imported only when a run builds this kind,
+      from .acme import AcmeAdapter, AcmeDevAdapter   # so an optional dep stays unpaid
+      return AdapterBuilder(
+          plain=AcmeAdapter,          # the plain class
+          dev=AcmeDevAdapter,         # the _DevSynthesisMixin-composed dev/review class
+          construct_error=(),         # exception type(s) __init__ may raise; () = none
+      )
+
+  register_adapter("acme", needs_mux=True, load=_load)   # needs_mux: does it drive a multiplexer?
+  ```
+
+  ```toml
+  # pyproject.toml
+  [project.entry-points."bmad_loop.adapters"]
+  acme = "acme_adapter"
+  ```
+
+- **`bmad_loop.profiles`** → a callable returning `CLIProfile`s (or an iterable of
+  them), so the profile that _selects_ your kind ships with it — no project TOML
+  required. Precedence is packaged < entry-point < project, so a project TOML can
+  still override it:
+
+  ```python
+  # acme_adapter/__init__.py  (same package)
+  from bmad_loop.adapters.profile import CLIProfile, HookSpec
+
+  def profiles():
+      return [CLIProfile(name="acme", binary="acme", adapter="acme",
+                         hooks=HookSpec("none", "", {}))]
+  ```
+
+  ```toml
+  [project.entry-points."bmad_loop.profiles"]
+  acme = "acme_adapter:profiles"
+  ```
+
+Once co-installed, `bmad-loop adapters` lists the kind and the profiles that select
+it, `bmad-loop validate` checks the reference (an `adapter.kind` finding, resolved
+against the live registry — never a hardcoded set), and a run whose
+`[adapter] name = "acme"` selects it. A broken package degrades to a
+`bmad-loop adapters` / `validate` warning, never a selection crash.
+
+Two seam facts worth internalizing:
+
+- **`needs_mux`** gates whether the run bootstrap resolves and usability-checks the
+  shared terminal multiplexer for your family. A tmux/hook family sets it `True`;
+  a self-hosted HTTP/SSE family (like opencode) sets it `False` and is never handed
+  a `mux`.
+- **The `dev` / `plain` split is a pipeline concept, not a per-family branch.** When
+  a dev/review session runs the `bmad-dev-auto` skill (which writes no
+  `result.json`), the engine builds the `dev` variant — the `_DevSynthesisMixin`-
+  composed class — and threads the project `paths` into it so it can synthesize the
+  result from the spec on disk; every other role builds `plain`. Both variants of a
+  family share the `(*args, paths, **kwargs)` dev `__init__` contract, so honoring
+  it is all an out-of-tree class must do to slot into that machinery.
 
 ### References
 

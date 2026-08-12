@@ -1,0 +1,29 @@
+# Mirror-fork auto-sync — lives on the `fork-sync` default branch ONLY.
+# `main` stays a verbatim fast-forward mirror of bmad-code-org/bmad-loop:
+# nothing is ever committed to it, so the merge-upstream API call below can
+# never hit a conflict or produce merge commits, and upstream SHAs stay
+# byte-identical for pinning.
+#
+# Sync runs with the built-in GITHUB_TOKEN on purpose: pushes made with it do
+# not trigger other workflows, so upstream's ci.yml / release.yml (push: main)
+# stay dormant on this fork. Do not replace it with a PAT.
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "23 21 * * *" # daily 04:23 Asia/Ho_Chi_Minh
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository == 'sirendhead/bmad-loop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fast-forward main from bmad-code-org/bmad-loop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh repo sync sirendhead/bmad-loop --branch main

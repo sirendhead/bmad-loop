@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -3842,6 +3843,161 @@ def test_read_usage_single_read_when_no_grace(tmp_path, monkeypatch):
 def test_read_usage_none_without_transcript(tmp_path):
     adapter = _usage_adapter(tmp_path, "copilot")
     assert adapter.read_usage(SessionResult(status="completed")) is None
+
+
+def test_read_usage_discovers_codex_rollout_without_transcript_path(tmp_path, monkeypatch):
+    """#775: a Codex Stop payload may carry no transcript_path (or no Stop
+    ever arrives at all — a post-kill rescue), so read_usage must recover
+    the rollout from (session_id, cwd, launch time) alone via
+    tokens.discover_transcript. See test_read_usage_none_without_transcript
+    above: that copilot case has neither session_id nor cwd to anchor on and
+    must stay None — this test proves the codex/cwd-anchored case instead."""
+    fake_home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    # `discover_transcript`'s real (non-test) call site relies on plain
+    # `os.path.expanduser("~")` honoring the monkeypatched home — true on
+    # both POSIX (HOME) and Windows (USERPROFILE) per the stdlib os.path docs;
+    # proven directly rather than assumed.
+    assert os.path.expanduser("~") == str(fake_home)
+
+    project = tmp_path / "project"
+    project.mkdir()
+    rollout_dir = fake_home / ".codex" / "sessions" / "2026" / "09" / "10"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / "rollout-2026-09-10T00-00-00-deadbeef.jsonl"
+    launched_at = time.time() - 30
+    # session_meta.payload.timestamp is what the earliest-after-launch
+    # selection (#775 follow-up) actually scores candidates on — a rollout
+    # with no parseable timestamp is excluded, not just mtime-ranked.
+    start_iso = datetime.fromtimestamp(launched_at + 2, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z"
+    )
+    lines = [
+        {
+            "type": "session_meta",
+            "payload": {"id": "deadbeef", "cwd": str(project), "timestamp": start_iso},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 500,
+                        "cached_input_tokens": 200,
+                        "output_tokens": 60,
+                    }
+                },
+            },
+        },
+    ]
+    rollout.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    os.utime(rollout, (launched_at + 5, launched_at + 5))
+
+    adapter = _usage_adapter(tmp_path, "codex")
+    result = SessionResult(
+        status="completed",
+        session_id=None,
+        transcript_path=None,
+        cwd=str(project),
+        launched_at=launched_at,
+    )
+    usage = adapter.read_usage(result)
+    assert usage is not None
+    assert usage.input_tokens == 300  # cached portion split out of input
+    assert usage.cache_read_tokens == 200
+    assert usage.output_tokens == 60
+
+
+def test_usage_anchor_is_actual_launch(tmp_path, monkeypatch):
+    """#775 review finding 4: `launched_at` must be the session's actual
+    launch time (`handle.launched_ns`), not whatever wall-clock time.time()
+    reads when wait_for_completion happens to start. A delayed wait
+    (queueing, a busy engine tick) must not shift the usage-discovery anchor
+    forward and risk excluding the real rollout.
+
+    Ablation: revert to `launched_at = wall_deadline - spec.timeout_s`
+    (dropping the `handle.launched_ns` source) and this test fails alone —
+    2180.0 (the mocked "now") instead of 2000.0 (the actual launch)."""
+    adapter = _usage_adapter(tmp_path, "codex")
+    monkeypatch.setattr(generic.time, "time", lambda: 2180.0)
+    monkeypatch.setattr(adapter, "_note_lifecycle", lambda *a, **k: None)
+    handle = SessionHandle(task_id="3-1-dev-1", native_id="@1", launched_ns=2000 * 10**9)
+    result = adapter.wait_for_completion(handle, _short_spec(tmp_path, timeout_s=0))
+    assert result.launched_at == 2000.0
+
+
+def test_usage_anchor_falls_back_to_wait_start_for_legacy_zero_handle(tmp_path, monkeypatch):
+    """A handle with no launched_ns (the raw dataclass default, or a mux
+    backend that never stamps one) has no real launch time to recover — the
+    wait-start wall clock is the best available fallback, same as before
+    #775 review finding 4."""
+    adapter = _usage_adapter(tmp_path, "codex")
+    monkeypatch.setattr(generic.time, "time", lambda: 2180.0)
+    monkeypatch.setattr(adapter, "_note_lifecycle", lambda *a, **k: None)
+    handle = SessionHandle(task_id="3-1-dev-1", native_id="@1", launched_ns=0)
+    result = adapter.wait_for_completion(handle, _short_spec(tmp_path, timeout_s=0))
+    assert result.launched_at == 2180.0
+
+
+def test_discovered_tally_decode_failure(tmp_path, monkeypatch):
+    """#775 review pass 2 finding 4: the discovered-path tally-exception fix
+    (generic.read_usage wrapping tally_usage in (OSError, UnicodeDecodeError,
+    ValueError) for a discovered path) had no test exercising it directly —
+    the pass-1 encoding tests only covered discover_transcript itself, and
+    the discovery-success test only ever tallies valid content. Isolate the
+    fix by monkeypatching discover_transcript to hand back a path and
+    tally_usage to raise on it.
+
+    Ablation: remove the `try/except (OSError, UnicodeDecodeError,
+    ValueError)` around the discovered-path `tally_usage` call in
+    generic.read_usage (reverting to a bare, unguarded call) and this test
+    fails alone — the UnicodeDecodeError escapes read_usage instead of
+    coming back as None."""
+    adapter = _usage_adapter(tmp_path, "codex", usage_grace_s=0)
+    monkeypatch.setattr(generic, "discover_transcript", lambda *a, **kw: tmp_path / "rollout.jsonl")
+
+    def unreadable(*args):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+
+    monkeypatch.setattr(generic, "tally_usage", unreadable)
+    assert adapter.read_usage(SessionResult(status="completed")) is None
+
+
+def test_discovered_partial_tail(tmp_path, monkeypatch):
+    """#775 review pass 4: a discovered rollout with a VALID header (so
+    discover_transcript matches it fine by filename) followed by a deeply
+    nested/truncated-mid-write partial tail line must not raise
+    RecursionError out of read_usage's TALLY read — a separate boundary from
+    discovery's own header peek (`_read_first_json_line`, pass 3 finding 2):
+    `tally_codex_rollout` iterates every line via `_jsonl_entries`, which
+    only ever catches `json.JSONDecodeError`, so the pathological tail
+    line's `RecursionError` propagated straight through `tally_usage` and
+    out of `read_usage` on Python 3.13 even after the pass-3 fix. Uses the
+    same HOME/USERPROFILE override pattern as
+    test_read_usage_discovers_codex_rollout_without_transcript_path, so
+    discovery itself runs for real rather than being monkeypatched away.
+
+    Ablation: drop `RecursionError` (and `MemoryError`) from the
+    discovered-path except clause in `generic.read_usage` and this test
+    fails alone — `RecursionError` escapes instead of `read_usage`
+    returning `None`."""
+    fake_home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    assert os.path.expanduser("~") == str(fake_home)
+
+    rollout_dir = fake_home / ".codex" / "sessions" / "2026" / "09" / "10"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / "rollout-ours.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"ours"}}\n' + '{"payload":' + "[" * 10000,
+        encoding="utf-8",
+    )
+
+    adapter = _usage_adapter(tmp_path, "codex", usage_grace_s=0)
+    assert adapter.read_usage(SessionResult(status="completed", session_id="ours")) is None
 
 
 def _write_fake_cli(tmp_path, script: str = FAKE_CLI):

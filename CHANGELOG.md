@@ -291,6 +291,14 @@ breaking changes may land in a minor release.
 
 ### Fixed
 
+- **Codex usage is recovered when the Stop payload carries no `transcript_path`, or no Stop
+  arrives at all.** `read_usage` now falls back to `tokens.discover_transcript`, which locates
+  the rollout from the session's `session_id`, `cwd`, and launch time alone — the same
+  recovery anchors a post-kill rescue (a lost Stop) still carries, since `SessionResult` now
+  threads `cwd`/`launched_at` through every exit including `_post_kill_reconcile`. Previously
+  a Codex session missing `transcript_path` recorded `tokens: null` unconditionally (#775).
+  Claude/Gemini/Copilot behavior is unchanged.
+
 - **The TUI's re-arm declines a contended run instead of waiting for it.** The
   gesture runs on Textual's message loop, so taking the run's state lock blocking
   froze the whole dashboard for as long as a rival held it — unbounded on POSIX,

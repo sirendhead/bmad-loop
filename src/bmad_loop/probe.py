@@ -65,7 +65,7 @@ from .process_host import get_process_host
 # diagnostics — the noqa keeps ruff's F401 autofix from deleting the re-export.
 from .sanitize import LeakDetected  # noqa: F401 — re-export
 from .signals import SignalWatcher
-from .tokens import _jsonl_entries, read_usage
+from .tokens import TRANSCRIPT_GLOBS, _jsonl_entries, read_usage
 
 # Version of the `--json` document (machine.py contract). Distinct from the
 # document's `version` key, which holds the *probed CLI's* `--version` output.
@@ -74,13 +74,9 @@ from .tokens import _jsonl_entries, read_usage
 # which the additive-only contract says must bump the version (#199).
 SCHEMA_VERSION = 2
 
-# Per-parser transcript-location conventions (from tokens.py docstrings).
-TRANSCRIPT_GLOBS = {
-    "claude-jsonl": "~/.claude/projects/*/*.jsonl",
-    "codex-rollout": "~/.codex/sessions/*/*/*/rollout-*.jsonl",
-    "gemini-chat": "~/.gemini/tmp/*/chats/session-*.jsonl",
-    "copilot-events": "~/.copilot/session-state/*/events.jsonl",
-}
+# Per-parser transcript-location conventions — TRANSCRIPT_GLOBS lives in
+# tokens.py (imported above) so `tokens.discover_transcript` (#775) and this
+# module's own `discover_transcript` share one source of truth.
 # Fallback family glob keyed by the `cli` name, so a CLI whose usage_parser is
 # still "none" (e.g. antigravity, freshly added) still gets transcript discovery.
 FAMILY_GLOBS = {

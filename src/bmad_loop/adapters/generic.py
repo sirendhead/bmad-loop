@@ -38,6 +38,7 @@ from ..model import TokenUsage
 from ..policy import Policy
 from ..process_host import ProcessHostError, get_process_host
 from ..signals import SignalWatcher
+from ..tokens import discover_transcript
 from ..tokens import read_usage as tally_usage
 from ..verify import read_frontmatter, status_of
 from .base import (
@@ -315,6 +316,7 @@ class _ResultFileMixin:
         accept_result: bool = True,
         budget_weighted: int | None = None,
         stop_seen: bool = False,
+        launched_at: float | None = None,
     ) -> SessionResult:
         """Session is gone or done responding: completed if the result file
         landed anyway, otherwise the fallback status. ``accept_result=False``
@@ -376,6 +378,8 @@ class _ResultFileMixin:
             budget_weighted=budget_weighted,
             stop_seen=stop_seen,
             session_vanished=vanished,
+            cwd=str(spec.cwd),
+            launched_at=launched_at,
         )
 
     def _result_path(self, task_id: str) -> Path:
@@ -636,6 +640,17 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         # deadline — never extend it; all sub-waits below stay monotonic (a
         # wall clock stepped backward must not stretch the session).
         wall_deadline = time.time() + spec.timeout_s
+        # Launch wall time (#775): recovery anchor for `tokens.discover_transcript`
+        # when a Stop payload carries no `transcript_path`. `handle.launched_ns`
+        # (stamped by `start_session` right before launch) is the actual launch
+        # time; `wall_deadline - spec.timeout_s` is only a fallback for a legacy
+        # zero-valued handle (#775 review finding 4) — using "now" here instead
+        # would record when THIS WAIT started, not when the session did, and a
+        # delayed wait (queueing, a busy engine tick, a clock step) would shift
+        # the anchor forward and could exclude the real rollout.
+        launched_at = (
+            handle.launched_ns / 1e9 if handle.launched_ns > 0 else wall_deadline - spec.timeout_s
+        )
         session_id: str | None = None
         transcript_path: str | None = None
         nudges_left = self._stop_nudges
@@ -716,6 +731,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     timeout_expired_clock=expired,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    cwd=str(spec.cwd),
+                    launched_at=launched_at,
                 )
             # Hard-stop poll (#319), per-iteration and deliberately NOT inside
             # the heartbeat throttle below: the loop's own wait is capped at 5s
@@ -737,6 +754,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    cwd=str(spec.cwd),
+                    launched_at=launched_at,
                 )
             now = time.monotonic()
             if last_heartbeat is None or now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
@@ -807,6 +826,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                             transcript_path,
                                             budget_weighted=weighted,
                                             stop_seen=stop_seen,
+                                            launched_at=launched_at,
                                         )
                                 except MultiplexerError:
                                     pass
@@ -824,6 +844,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                     transcript_path=transcript_path,
                                     budget_weighted=weighted,
                                     stop_seen=stop_seen,
+                                    cwd=str(spec.cwd),
+                                    launched_at=launched_at,
                                 )
                             try:
                                 self.send_text(handle, BUDGET_NUDGE_TEXT)
@@ -856,6 +878,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                             transcript_path,
                             budget_weighted=budget_weighted,
                             stop_seen=stop_seen,
+                            launched_at=launched_at,
                         )
                 except MultiplexerError:
                     pass
@@ -873,6 +896,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    cwd=str(spec.cwd),
+                    launched_at=launched_at,
                 )
             event = self.watcher.wait_for(
                 handle.task_id,
@@ -900,6 +925,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path=transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    cwd=str(spec.cwd),
+                    launched_at=launched_at,
                 )
             if event is None:
                 try:
@@ -923,6 +950,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         transcript_path,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        launched_at=launched_at,
                     )
                 if stall_deadline is not None:
                     # No artifact shortcut here: the window is alive on this tick
@@ -982,6 +1010,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                                 transcript_path,
                                 budget_weighted=budget_weighted,
                                 stop_seen=stop_seen,
+                                launched_at=launched_at,
                             )
                     except MultiplexerError:
                         pass
@@ -997,6 +1026,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         accept_result=False,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        launched_at=launched_at,
                     )
                 continue
             if (
@@ -1031,6 +1061,8 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         transcript_path=transcript_path,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        cwd=str(spec.cwd),
+                        launched_at=launched_at,
                     )
                 if nudges_left > 0:
                     nudges_left -= 1
@@ -1050,6 +1082,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                         transcript_path,
                         budget_weighted=budget_weighted,
                         stop_seen=stop_seen,
+                        launched_at=launched_at,
                     )
                 # A result-less Stop, but the session may have ended its turn to
                 # await a background process (a Unity PlayMode run, a slow test)
@@ -1073,6 +1106,7 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
                     transcript_path,
                     budget_weighted=budget_weighted,
                     stop_seen=stop_seen,
+                    launched_at=launched_at,
                 )
 
     def _log_evidence(self, handle: SessionHandle) -> bool | None:
@@ -1297,16 +1331,50 @@ class GenericAdapter(_ResultFileMixin, EnvFaultMixin, CodingCLIAdapter):
         return usage.weighted_total(spec.cache_read_weight)
 
     def read_usage(self, result: SessionResult) -> TokenUsage | None:
+        discovered_path = False
         if not result.transcript_path:
-            return None
-        path = Path(result.transcript_path)
+            # The Stop payload carried no transcript_path (some CLIs never send
+            # one on certain paths) or none arrived at all — a post-kill rescue
+            # with no session_id/transcript either (#775). Recover from
+            # (session_id, cwd, launch time) alone via the same convention glob
+            # `probe-adapter` uses; None here preserves today's behaviour when
+            # neither anchor is available.
+            discovered = discover_transcript(
+                self.profile.usage_parser,
+                session_id=result.session_id,
+                cwd=result.cwd,
+                not_before=result.launched_at,
+            )
+            if discovered is None:
+                return None
+            path = discovered
+            discovered_path = True
+        else:
+            path = Path(result.transcript_path)
         # Some CLIs flush their token totals only on shutdown (Copilot writes
         # modelMetrics in the trailing session.shutdown line, ~1s after the
         # turn-end hook). Poll up to the effective grace so we don't sample the
         # transcript before the totals land. grace 0 = read once (today's path).
         deadline = time.monotonic() + self._usage_grace_s
         while True:
-            usage = tally_usage(self.profile.usage_parser, path)
+            if discovered_path:
+                # A discovered path (#775) is less trusted than one the Stop
+                # hook itself reported: it may be unreadable, mid-truncated by
+                # a concurrent writer, or not decodable at all. Same tolerance
+                # as `_sample_weighted_usage`'s live-tail read — treat as "no
+                # usage yet/ever", never raise out of read_usage (#775 review
+                # pass 2 finding 2). RecursionError/MemoryError join the set
+                # for the same reason `_read_first_json_line` catches them
+                # (#775 review pass 3 finding 2): a valid header followed by a
+                # deeply nested or truncated-mid-write tail blows the json
+                # decoder's recursion limit on the TALLY read too, not just
+                # discovery's own header peek (#775 review pass 4).
+                try:
+                    usage = tally_usage(self.profile.usage_parser, path)
+                except (OSError, UnicodeDecodeError, ValueError, RecursionError, MemoryError):
+                    usage = None
+            else:
+                usage = tally_usage(self.profile.usage_parser, path)
             if usage is not None or time.monotonic() >= deadline:
                 return usage
             time.sleep(RESULT_POLL_S)
@@ -2128,6 +2196,11 @@ class _DevSynthesisMixin(_ResultFileMixin):
             timeout_expired_clock=result.timeout_expired_clock,
             budget_weighted=result.budget_weighted,
             stop_seen=result.stop_seen,
+            # Copied like session_id/transcript_path (#775): a rescue that lost
+            # its Stop, and so both of those, still needs (cwd, launched_at) for
+            # `read_usage`'s transcript discovery to have anything to anchor on.
+            cwd=result.cwd,
+            launched_at=result.launched_at,
         )
 
 

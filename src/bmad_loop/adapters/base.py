@@ -250,6 +250,13 @@ class SessionResult:
     # stalled/timeout/over_budget, which this flag can never accompany; add it
     # there if `crashed` ever joins that rescue set.
     session_vanished: bool = False
+    # cwd of the launching SessionSpec and the wall time.time() the session
+    # launched (#775): recovery anchors for `tokens.discover_transcript` when
+    # a Stop payload carries no `transcript_path`, or no Stop ever arrives
+    # (a post-kill rescue). Populated by every SessionResult the generic
+    # adapter builds; None on adapters that never populate them.
+    cwd: str | None = None
+    launched_at: float | None = None
 
 
 class CodingCLIAdapter(ABC):
